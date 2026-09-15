@@ -1,6 +1,8 @@
+import contextlib
 import logging
 import math
 import os
+import time
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
@@ -42,6 +44,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_borrow_enabled,
 )
 from sglang.srt.runtime_context import (
+    get_context,
     get_exec,
     get_parallel,
     get_schedule,
@@ -50,6 +53,9 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    SpecRuntimeState,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -87,8 +93,14 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_tp_context,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import empty_context
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_cuda,
+    is_hip,
+    is_npu,
+    log_info_on_rank0,
+)
 
 _is_npu = is_npu()
 
@@ -477,6 +489,33 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"got {self.block_size}."
             )
 
+        # MAB-ABS: adaptive block_size decision. The decision layer
+        # (AdaptiveDFlashParams) is created here; the AdaptiveController that owns
+        # the per-B graph states is wired in init_cuda_graphs() (needs the
+        # just-captured live state to register as the initial state).
+        self._mab_controller = None
+        self._adaptive_controller = None
+        self._adaptive_tp_decision_buf = None
+        self._mab_enabled = bool(get_spec().speculative_adaptive_block_size)
+        if self._mab_enabled:
+            from sglang.srt.speculative.adaptive_spec_params import (
+                AdaptiveDFlashParams,
+            )
+
+            self._mab_controller = AdaptiveDFlashParams(
+                max_block_size=int(self.block_size),
+                cfg_path=get_spec().speculative_adaptive_config,
+            )
+            if get_tp_group().world_size > 1:
+                self._adaptive_tp_decision_buf = torch.zeros(
+                    (1,), dtype=torch.int32, device=self.device
+                )
+            logger.info(
+                "DFLASH MAB-ABS enabled: block_size=%d, candidates=%s",
+                self.block_size,
+                self._mab_controller.candidate_block_sizes,
+            )
+
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
         self._mask_token_id = self._resolve_mask_token_id(
@@ -569,6 +608,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # draft KV is materialized from target hidden states, so there is no
         # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
         return self._draft_worker
+
+    @property
+    def speculative_num_steps(self) -> int:
+        """AdaptiveController's step axis. DFLASH is single-step, so we reuse this
+        axis to carry the active block_size (each "step" key == a block_size)."""
+        return int(self.block_size)
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -760,6 +805,361 @@ class DFlashWorkerV2(BaseSpecWorker):
             result.sampling_headroom_bytes,
         )
         return result
+
+        # MAB-ABS: register the current (just-captured) state and build every
+        # lower candidate state. DFLASH drives the controller's step axis as
+        # block_size (draft_tokens_from_steps = identity), so a "step" == a
+        # block_size and each state bundles its own draft+target graphs.
+        if self._mab_enabled and self._mab_controller is not None:
+            from sglang.srt.speculative.adaptive_runtime_state import (
+                AdaptiveController,
+            )
+
+            self._adaptive_controller = AdaptiveController(
+                self,
+                params=self._mab_controller,
+                draft_tokens_from_steps=lambda b: b,
+            )
+            # Register the live state (the graphs init just captured at current B).
+            self._adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=int(self.block_size),
+                    speculative_num_draft_tokens=int(self.block_size),
+                    draft_attn_backend=self.draft_model_runner.attn_backend,
+                    cuda_graph_runner=self.draft_model_runner.decode_cuda_graph_runner,
+                    target_attn_backend=self._target_worker.model_runner.attn_backend,
+                    target_graph_runner=(
+                        self._target_worker.model_runner.decode_cuda_graph_runner
+                    ),
+                    draft_extend_attn_backend=None,
+                    cuda_graph_runner_for_draft_extend=None,
+                    dflash_draft_sampler=self._draft_sampler,
+                    dflash_block_pos_offsets=self._block_pos_offsets,
+                    dflash_draft_block_spec_info=self._draft_block_spec_info,
+                    dflash_fused_kv_helper=self._fused_kv_helper,
+                ),
+                steps=int(self.block_size),
+            )
+            # Build lower candidate states with BS-pruned graph buckets.  The
+            # initial block size is the hard ceiling for every slot.
+            cuda_graph_bs = (
+                None
+                if not capture_decode_cuda_graph
+                else get_exec().graph.cuda_graph_config.decode.bs
+            )
+            self._adaptive_controller.init_states(cuda_graph_bs=cuda_graph_bs)
+        else:
+            self._adaptive_controller = None
+
+    def on_verify_complete_cpu(
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        step_time_ms: float = 0.0,
+    ) -> None:
+        """Feed MAB-ABS controller with accept lengths after verify (CPU-side, no sync).
+
+        The controller decides whether to switch block_size; on a warranted switch
+        it applies the pre-built per-B runtime state (draft+target graphs) via
+        apply_runtime_state(). This hook runs on the result-processing CPU path,
+        off the worker hot loop (no GPU sync).
+        """
+        if self._adaptive_controller is None:
+            return
+        if not num_correct_drafts_per_req:
+            return
+        # Only TP rank 0 owns the decision. Timing can differ slightly across
+        # TP ranks even though accept lengths are synchronized; letting each
+        # rank decide locally could desynchronize graph widths. Broadcast one
+        # int every round through the existing TP group, with no new comm layer.
+        new_block_size = None
+        if self.ps.tp_rank == 0:
+            # The scheduler feeds GPU-side elapsed time; MAB-ABS consumes
+            # commit lengths (num correct + the always-accepted bonus token).
+            new_block_size = self._mab_controller.on_verify_complete(
+                [num_correct + 1 for num_correct in num_correct_drafts_per_req],
+                batch_size,
+                step_time_ms=step_time_ms,
+            )
+
+        tp_group = get_tp_group()
+        if tp_group.world_size == 1:
+            synced_block_size = new_block_size
+        else:
+            decision = self._adaptive_tp_decision_buf
+            if self.ps.tp_rank == 0:
+                decision.fill_(new_block_size or 0)
+            tp_group.broadcast(decision, src=0)
+            synced_block_size = int(decision.item())
+
+        if synced_block_size:
+            self._mab_controller.set_block_size_for_batch(
+                batch_size, synced_block_size
+            )
+            self._adaptive_controller.activate_step(synced_block_size)
+
+    def activate_step_by_batch(self, batch_size: int) -> None:
+        """Activate the per-BS optimal block_size state before each draft round."""
+        if self._adaptive_controller is None:
+            return
+        self._adaptive_controller.activate_step_by_batch(batch_size)
+
+    # ------------------------------------------------------------------
+    # Adaptive block_size (MAB-ABS): per-block_size runtime state capture.
+    #
+    # Each candidate block_size B needs a full runtime state because BOTH the
+    # draft graph and the target verify graph embed B in their captured width
+    # (captured_req_width == B), AND the draft graph constant-folds the conv
+    # `position & (B-1)` / `position % B` alignment into the captured kernels
+    # (see DFlashGroupedConv._convolve). A stale draft graph replays WRONG
+    # draft tokens, so we cannot merely retarget the graph — we must recapture
+    # both. This is the dominant cost: 2 graph captures per candidate B.
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _override_worker_state(
+        self,
+        block_size: int,
+        cuda_graph_bs: list[int] | None = None,
+    ):
+        """Temporarily override block_size + context bag for graph capture.
+
+        The DecodeCudaGraphRunner reads speculative_num_draft_tokens from the
+        context bag (get_spec()) to compute captured_req_width, so we must
+        override it before constructing/capturing each per-B graph, then restore
+        exactly in `finally` so subsequent captures/apply see the prior state.
+        """
+        graph_config = get_exec().graph.cuda_graph_config
+        backup_decode_bs = graph_config.decode.bs if graph_config is not None else None
+        override_decode_bs = graph_config is not None and bool(cuda_graph_bs)
+        backup = (
+            self.block_size,
+            self.speculative_num_draft_tokens,
+            get_spec().speculative_num_draft_tokens,
+            get_exec().graph.cuda_graph_bs_decode,
+            get_exec().graph.disable_cuda_graph,
+            # Runner-level state that init_decode_cuda_graph()/init_attention_backends()
+            # will overwrite; restore so the *current* (already-live) state keeps
+            # serving until we explicitly apply_runtime_state() to switch.
+            self.draft_model_runner.decode_cuda_graph_runner,
+            list(self.draft_model_runner.capture_tail_hooks),
+            self.draft_model_runner.attn_backend,
+        )
+
+        self.block_size = int(block_size)
+        self.speculative_num_draft_tokens = int(block_size)
+        self.draft_model.set_block_size(self.block_size)
+        get_context().override(
+            "adaptive_block_size.capture_override",
+            speculative_num_draft_tokens=int(block_size),
+        )
+        if cuda_graph_bs is not None:
+            # Pruned-to-empty bucket list means this B is unreachable at runtime;
+            # disable graph capture for it entirely (runs eager), restore after.
+            get_context().override(
+                "adaptive_block_size.capture_override",
+                cuda_graph_bs_decode=cuda_graph_bs,
+                **({"disable_cuda_graph": True} if not cuda_graph_bs else {}),
+            )
+        if override_decode_bs:
+            # DecodeCudaGraphRunner reads the nested graph config, not the flat
+            # legacy leaf above.  Rebind (never mutate) the list for this capture.
+            graph_config.decode.bs = list(cuda_graph_bs)
+
+        try:
+            yield
+        finally:
+            (
+                self.block_size,
+                self.speculative_num_draft_tokens,
+            ) = backup[:2]
+            self.draft_model.set_block_size(self.block_size)
+            get_context().override(
+                "adaptive_block_size.capture_restore",
+                speculative_num_draft_tokens=backup[2],
+                cuda_graph_bs_decode=backup[3],
+                disable_cuda_graph=backup[4],
+            )
+            # Restore the live draft graph runner + sampler hooks + attn backend that
+            # the per-B capture just clobbered.
+            self.draft_model_runner.decode_cuda_graph_runner = backup[5]
+            self.draft_model_runner.capture_tail_hooks = backup[6]
+            self.draft_model_runner.attn_backend = backup[7]
+            if override_decode_bs:
+                graph_config.decode.bs = backup_decode_bs
+
+    def build_adaptive_runtime_state(
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
+    ) -> SpecRuntimeState:
+        """Build a complete runtime state for one candidate block_size.
+
+        NOTE on the signature: AdaptiveController drives the generic spec axis
+        as (num_steps, num_draft_tokens). For DFLASH we only vary block_size, so
+        we always keep speculative_num_steps == 1 and treat
+        ``speculative_num_draft_tokens`` as the candidate block_size B.
+
+        A state for B bundles:
+          * the draft graph runner (recaptured; conv alignment depends on B)
+          * the target verify graph runner (captured_req_width == B)
+          * the draft sampler (in-graph head) + its capture hook
+          * DFLASH per-B buffers/helpers (block_pos_offsets, spec_info, fused KV)
+        """
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Phase,
+            check_cuda_graph_backend,
+        )
+        from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+
+        block_size = int(speculative_num_draft_tokens)
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+
+        with self._override_worker_state(block_size, cuda_graph_bs=cuda_graph_bs):
+            # 1) Rebuild per-B DFLASH helpers whose shapes/constants depend on B.
+            self._block_pos_offsets = build_block_pos_offsets(
+                length=self.block_size, device=self.device
+            )
+            self._draft_block_spec_info = make_draft_block_spec_info(
+                draft_token_num=int(self.block_size), device=self.device
+            )
+            # Block-shaped buffers: force re-alloc at this B (the ensure helpers
+            # rebuild when shape[1] != block_size after the bug-fix in this file).
+            self._ensure_draft_block_buffers(0)  # re-allocates lazily on next use
+            self._ensure_accept_bonus_buffers(0)
+            self._draft_greedy_gather_cap = 0  # lazily re-created at first use
+            self._fused_kv_helper = None
+            if self._use_fused_kv_materialize:
+                self._init_fused_kv_helper()
+
+            # 2) Rebuild the draft sampler and re-register its in-graph capture
+            #    hook onto the *new* draft runner before capturing its graph.
+            self._draft_sampler = self._maybe_build_draft_sampler()
+            if self._draft_sampler is not None:
+                self.draft_model_runner.capture_tail_hooks = [
+                    make_draft_sampler_capture_hook(self._draft_sampler)
+                ]
+
+            # 3) Recapture the DRAFT decode graph for this B. Use
+            #    init_decode_cuda_graph() (decode-only) rather than the full
+            #    init_cuda_graphs(): the latter would also re-run prefill capture
+            #    and reset eager_runner/graph_memory_usage on the live runner,
+            #    corrupting the in-service state during the capture loop.
+            #    The draft runner is a plain TpModelWorker wrapping a base
+            #    DecodeCudaGraphRunner; its captured_req_width ==
+            #    speculative_num_draft_tokens (overridden to B above). Conv
+            #    position alignment is baked in at capture, so this is mandatory.
+            #    Rebuild the draft attention backend FIRST so its per-B metadata
+            #    buffers match this B (otherwise FA3 verify kernel reads stale
+            #    sized workspace → illegal memory access on the 2nd candidate).
+            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+                self.draft_model_runner.init_attention_backends()
+                self.draft_model_runner.init_decode_cuda_graph()
+            draft_graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+            draft_attn_backend = self.draft_model_runner.attn_backend
+
+            # 4) Build the target verify graph runner for this B. The target
+            #    runner's captured_req_width == speculative_num_draft_tokens = B.
+            target_model_runner = self._target_worker.model_runner
+            backup_init = target_model_runner.init_new_workspace
+            try:
+                target_attn_backend = target_model_runner._get_attention_backend(
+                    init_new_workspace=True
+                )
+            finally:
+                target_model_runner.init_new_workspace = backup_init
+
+            target_graph_runner = None
+            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+                target_graph_runner = DecodeCudaGraphRunner(
+                    target_model_runner,
+                    attn_backend=target_attn_backend,
+                    speculative_num_steps=1,
+                    speculative_num_draft_tokens=block_size,
+                )
+
+            state = SpecRuntimeState(
+                speculative_num_steps=1,
+                speculative_num_draft_tokens=block_size,
+                draft_attn_backend=draft_attn_backend,
+                cuda_graph_runner=draft_graph_runner,
+                target_attn_backend=target_attn_backend,
+                target_graph_runner=target_graph_runner,
+                draft_extend_attn_backend=None,  # DFLASH has no draft-extend split
+                cuda_graph_runner_for_draft_extend=None,
+                dflash_draft_sampler=self._draft_sampler,
+                dflash_block_pos_offsets=self._block_pos_offsets,
+                dflash_draft_block_spec_info=self._draft_block_spec_info,
+                dflash_fused_kv_helper=self._fused_kv_helper,
+            )
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        log_info_on_rank0(
+            logger,
+            f"Built DFLASH adaptive runtime state block_size={block_size}: "
+            f"elapsed={time.perf_counter() - tic:.2f}s, "
+            f"mem={(before_mem - after_mem):.2f}GB",
+        )
+        return state
+
+    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+        """Atomically switch to a pre-built per-block_size runtime state.
+
+        DFLASH swaps BOTH the draft and the target-verify CUDA graph runners
+        (each state's captured_req_width == its block_size, and the draft graph
+        has the conv position alignment for that B baked in at capture time).
+        The DFLASH-specific per-B helpers (sampler, block offsets, spec_info,
+        fused KV) are carried on the state and swapped alongside.
+        """
+        new_block_size = int(state.speculative_num_draft_tokens)
+        if self.block_size == new_block_size:
+            return
+
+        log_info_on_rank0(
+            logger,
+            f"DFLASH switch adaptive runtime state: block_size "
+            f"{self.block_size} -> {new_block_size}",
+        )
+
+        # Top-level scalars.
+        self.block_size = new_block_size
+        self.speculative_num_draft_tokens = new_block_size
+        # Conv position alignment must follow B before the new draft graph replays.
+        self.draft_model.set_block_size(new_block_size)
+
+        # Draft side: graph runner + attn backend + sampler + per-B helpers.
+        self.draft_model_runner.decode_cuda_graph_runner = state.cuda_graph_runner
+        if state.draft_attn_backend is not None:
+            self.draft_model_runner.attn_backend = state.draft_attn_backend
+        self._draft_sampler = state.dflash_draft_sampler
+        self._block_pos_offsets = state.dflash_block_pos_offsets
+        self._draft_block_spec_info = state.dflash_draft_block_spec_info
+        self._fused_kv_helper = state.dflash_fused_kv_helper
+        self._use_fused_kv_materialize = self._fused_kv_helper is not None
+        # Re-attach the new state's sampler hook to the new draft runner.
+        if self._draft_sampler is not None:
+            self.draft_model_runner.capture_tail_hooks = [
+                make_draft_sampler_capture_hook(self._draft_sampler)
+            ]
+        # Force the block-shaped scratch buffers to re-alloc at the new width on
+        # next use (self-healing ensure helpers key off _buf_block_size).
+        self._draft_block_buf_block_size = 0
+        self._accept_bonus_buf_block_size = 0
+
+        # Target side: verify graph runner + attn backend.
+        self._target_worker.model_runner.decode_cuda_graph_runner = (
+            state.target_graph_runner
+        )
+        self._target_worker.model_runner.attn_backend = state.target_attn_backend
+
+        # Sync the context bag so any consumer reading get_spec() (e.g. the
+        # DecodeCudaGraphRunner width guard) sees the active block_size.
+        get_context().override(
+            "adaptive_block_size.apply",
+            speculative_num_draft_tokens=new_block_size,
+        )
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
@@ -958,17 +1358,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._fused_kv_helper = None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
+        # Self-healing: rebuild when bs grows OR block_size changed (adaptive).
+        # These buffers are graph-external scratch (written by the prepare-block
+        # kernel each step, then copied into the draft graph's static inputs by
+        # load_batch). Rebuilding them never invalidates a captured graph — the
+        # graph binds its own static buffers, not these.
+        block_size = int(self.block_size)
         cap = (
             0
             if self._draft_block_ids_buf is None
             else int(self._draft_block_ids_buf.shape[0])
         )
-        if cap >= int(bs):
+        buf_block_size = getattr(self, "_draft_block_buf_block_size", 0)
+        if cap >= int(bs) and buf_block_size == block_size:
             return
 
         new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
         device = self.device
-        block_size = int(self.block_size)
         self._draft_block_ids_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
         )
@@ -987,6 +1393,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+        self._draft_block_buf_block_size = block_size
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
@@ -2002,7 +2409,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
-        if self._accept_bonus_buffer_cap >= int(bs):
+        # Self-healing: rebuild when bs grows OR block_size changed (adaptive).
+        # Only `_out_tokens_bufs` is block-shaped; the rest are [cap_bs] and safe,
+        # but rebuilding all together keeps the double-buffer slot logic simple.
+        block_size = int(self.block_size)
+        buf_block_size = getattr(self, "_accept_bonus_buf_block_size", 0)
+        if self._accept_bonus_buffer_cap >= int(bs) and buf_block_size == block_size:
             return
 
         new_cap = max(
@@ -2014,7 +2426,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
         )
         device = self.device
-        block_size = int(self.block_size)
         self._accept_len_buf = torch.empty((new_cap,), dtype=torch.int32, device=device)
         self._commit_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
@@ -2031,6 +2442,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
         ]
         self._accept_bonus_buffer_cap = new_cap
+        self._accept_bonus_buf_block_size = block_size
 
     def _next_accept_bonus_buffers(
         self, bs: int
@@ -2325,6 +2737,19 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+
+        self.activate_step_by_batch(bs)
+        adaptive_step_start_event = (
+            torch.cuda.Event(enable_timing=True)
+            if (
+                self._adaptive_controller is not None
+                and self.ps.tp_rank == 0
+                and self.device.startswith("cuda")
+            )
+            else None
+        )
+        if adaptive_step_start_event is not None:
+            adaptive_step_start_event.record()
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -2760,6 +3185,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
         )
 
+        adaptive_step_end_event = None
+        if adaptive_step_start_event is not None:
+            adaptive_step_end_event = torch.cuda.Event(enable_timing=True)
+            adaptive_step_end_event.record()
+
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
@@ -2770,6 +3200,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
+            adaptive_step_start_event=adaptive_step_start_event,
+            adaptive_step_end_event=adaptive_step_end_event,
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
         )

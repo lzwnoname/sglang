@@ -770,11 +770,24 @@ class SchedulerBatchResultProcessor:
         cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
         result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
 
+        step_time_ms = 0.0
+        if (
+            result.adaptive_step_start_event is not None
+            and result.adaptive_step_end_event is not None
+        ):
+            step_time_ms = (
+                result.adaptive_step_start_event.elapsed_time(
+                    result.adaptive_step_end_event
+                )
+            )
+
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            result.num_correct_drafts_per_req_cpu,
+            batch_size=len(batch.reqs),
+            step_time_ms=step_time_ms,
         )
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):

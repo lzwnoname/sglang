@@ -118,6 +118,11 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    # DFLASH MAB-ABS: one complete draft+verify round, measured on the forward
+    # stream.  Elapsed time is consumed only after copy_done synchronizes.
+    adaptive_step_start_event: Optional[torch.cuda.Event] = None
+    adaptive_step_end_event: Optional[torch.cuda.Event] = None
+
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 
     @property

@@ -13,6 +13,12 @@ import triton.language as tl
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 
 
+# Real GDN states have 768 1024-element chunks per (layer, request).  At the
+# production bs=27 DFlash shape, two chunks per program removes the masked-set
+# launch overhead while retaining enough blocks to saturate HBM.
+_SCATTER_ITERS = 2
+
+
 def _require_entry_contiguous_dst(
     dst: torch.Tensor, entry_start_dim: int, fn_name: str
 ) -> None:
@@ -163,6 +169,7 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     src_step_size,
     dst_req_size,
     BLOCK_SIZE: tl.constexpr,
+    ITERS: tl.constexpr,
 ):
     """
     Fused gather-scatter kernel with built-in masking.
@@ -210,14 +217,12 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     )
     dst_offset = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
 
-    # Compute element range for this block
-    start = pid_block * BLOCK_SIZE
-    offsets = start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < elem_per_entry
-
-    # Load from source and store to destination
-    data = tl.load(src_ptr + src_offset + offsets, mask=mask)
-    tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
+    base = pid_block * (BLOCK_SIZE * ITERS)
+    for it in tl.range(ITERS):
+        offsets = base + it * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < elem_per_entry
+        data = tl.load(src_ptr + src_offset + offsets, mask=mask)
+        tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
 
 
 def fused_mamba_state_scatter_with_mask(
@@ -300,7 +305,11 @@ def fused_mamba_state_scatter_with_mask(
     BLOCK_SIZE = 1024
 
     # Grid over all requests - invalid ones will early-exit in the kernel
-    grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+    grid = (
+        total_requests,
+        num_layers,
+        triton.cdiv(elem_per_entry, BLOCK_SIZE * _SCATTER_ITERS),
+    )
 
     _fused_mamba_state_scatter_with_mask_kernel[grid](
         src,
@@ -317,6 +326,130 @@ def fused_mamba_state_scatter_with_mask(
         src_step_size,
         dst_req_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        ITERS=_SCATTER_ITERS,
+    )
+
+
+@triton.jit
+def _fused_mamba_state_scatter_multi_kernel(
+    src_ptr,
+    dst_ptr,
+    # Two request-index sets: set 1 (accept commit) and set 2 (interval track).
+    dst_indices1_raw_ptr,  # [n1]
+    step_indices1_raw_ptr,  # [n1], entry >= 0 means valid
+    dst_indices2_raw_ptr,  # [n2]
+    step_indices2_raw_ptr,  # [n2], entry >= 0 means valid
+    n1,
+    elem_per_entry: tl.constexpr,
+    src_layer_stride,
+    src_req_stride,
+    src_step_stride,
+    dst_layer_stride,
+    dst_req_stride,
+    src_req_size,
+    src_step_size,
+    dst_req_size,
+    BLOCK_SIZE: tl.constexpr,
+    ITERS: tl.constexpr,
+):
+    """Single-launch variant of ``_fused_mamba_state_scatter_with_mask_kernel``
+    over two request-index sets (the accept commit set plus the optional
+    interval-crossing track set). ``pid_req < n1`` selects set 1, otherwise set
+    2 (offset by n1); invalid entries (step < 0) early-exit.
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+    pid_block = tl.program_id(2).to(tl.int64)
+
+    is2 = pid_req >= n1
+    off = tl.where(is2, pid_req - n1, pid_req)
+    step_idx = tl.where(
+        is2,
+        tl.load(step_indices2_raw_ptr + off, mask=is2, other=-1),
+        tl.load(step_indices1_raw_ptr + off, mask=not is2, other=-1),
+    ).to(tl.int64)
+    if step_idx < 0:
+        return
+
+    dst_idx = tl.where(
+        is2,
+        tl.load(dst_indices2_raw_ptr + off, mask=is2, other=-1),
+        tl.load(dst_indices1_raw_ptr + off, mask=not is2, other=-1),
+    ).to(tl.int64)
+    src_idx = off
+
+    if not (
+        (dst_idx >= 0)
+        & (dst_idx < dst_req_size)
+        & (src_idx < src_req_size)
+        & (step_idx < src_step_size)
+    ):
+        return
+
+    src_offset = (
+        pid_layer * src_layer_stride
+        + src_idx * src_req_stride
+        + step_idx * src_step_stride
+    )
+    dst_offset = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
+
+    base = pid_block * (BLOCK_SIZE * ITERS)
+    for it in tl.range(ITERS):
+        offsets = base + it * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < elem_per_entry
+        data = tl.load(src_ptr + src_offset + offsets, mask=mask)
+        tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
+
+
+def fused_mamba_state_scatter_multi(
+    dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
+    src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
+    dst_indices1_raw: torch.Tensor,  # [n1] accept commit dst indices
+    step_indices1_raw: torch.Tensor,  # [n1] accept commit step indices
+    dst_indices2_raw: torch.Tensor,  # [n2] track dst indices
+    step_indices2_raw: torch.Tensor,  # [n2] track step indices
+) -> None:
+    """Fuse the accept-commit and interval-track ssm state scatters into one
+    kernel launch (two request-index sets over the same dst/src pools)."""
+    num_layers = dst.shape[0]
+    src_req_size = src.shape[1]
+    src_step_size = src.shape[2]
+    dst_req_size = dst.shape[1]
+    elem_per_entry = dst.numel() // (dst.shape[0] * dst.shape[1])
+
+    dst_indices1_raw = dst_indices1_raw.to(torch.int32).contiguous()
+    step_indices1_raw = step_indices1_raw.to(torch.int32).contiguous()
+    dst_indices2_raw = dst_indices2_raw.to(torch.int32).contiguous()
+    step_indices2_raw = step_indices2_raw.to(torch.int32).contiguous()
+
+    n1 = step_indices1_raw.shape[0]
+    n2 = step_indices2_raw.shape[0]
+
+    BLOCK_SIZE = 1024
+    grid = (
+        n1 + n2,
+        num_layers,
+        triton.cdiv(elem_per_entry, BLOCK_SIZE * _SCATTER_ITERS),
+    )
+    _fused_mamba_state_scatter_multi_kernel[grid](
+        src,
+        dst,
+        dst_indices1_raw,
+        step_indices1_raw,
+        dst_indices2_raw,
+        step_indices2_raw,
+        n1,
+        elem_per_entry,
+        src.stride(0),
+        src.stride(1),
+        src.stride(2),
+        dst.stride(0),
+        dst.stride(1),
+        src_req_size,
+        src_step_size,
+        dst_req_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        ITERS=_SCATTER_ITERS,
     )
 
 
@@ -688,19 +821,22 @@ def scatter_mamba_states_after_mtp_verify(
     intermediate_state_cache = mamba_caches.intermediate_ssm
 
     if ssm_states.numel() > 0:
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
+            fused_mamba_state_scatter_multi(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+        else:
             fused_mamba_state_scatter_with_mask(
                 ssm_states,
                 intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
+                state_indices_tensor,
+                last_correct_step_indices,
             )
 
     pairs = list(zip(mamba_caches.conv, mamba_caches.intermediate_conv_window))

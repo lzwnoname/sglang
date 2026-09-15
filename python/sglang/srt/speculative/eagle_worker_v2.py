@@ -1454,7 +1454,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        step_time_ms: float = 0.0,
     ) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(

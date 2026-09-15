@@ -303,7 +303,10 @@ class AdaptiveSpeculativeParams:
         return self._route(batch_size).current_steps
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        step_time_ms: float = 0.0,
     ) -> int | None:
         """Feed verify results to the matching BS slot's EMA.
 
@@ -341,6 +344,328 @@ class AdaptiveSpeculativeParams:
         return (
             self._cuda_graph_bs[idx] if idx < len(self._cuda_graph_bs) else batch_size
         )
+
+    def _find_closest_bs(self, target: int) -> int:
+        idx = bisect.bisect_right(self._bs_list, target) - 1
+        return self._bs_list[max(0, idx)]
+
+
+# ============================================================================
+# DFLASH Adaptive Block Size (MAB-ABS — Marginal-Accept-Benefit Adaptive Block Size)
+# ============================================================================
+
+
+class PositionalAcceptHistogram:
+    """Batch-aggregated per-position conditional acceptance rates with EMA.
+
+    At block_size=B, each request's commit_len ∈ [1, B] (1=only bonus, B=all accepted).
+    For draft position i ∈ [1, B-1]: reach[i] += 1 if verified, pass[i] += 1 if accepted.
+    p_i = EMA(pass[i] / reach[i]).
+    """
+
+    def __init__(self, max_b: int, ema_alpha: float = 0.1, prior: float = 0.5):
+        self.max_b = max_b
+        self.alpha = ema_alpha
+        self.p = [prior] * (max_b + 1)
+        self.w = [0.0] * (max_b + 1)
+
+    def update(self, commit_lens: list[int], verify_len: int) -> None:
+        if not commit_lens:
+            return
+        a = self.alpha
+        reach = [0.0] * (self.max_b + 1)
+        pas = [0.0] * (self.max_b + 1)
+        for al in commit_lens:
+            for i in range(1, verify_len):
+                reach[i] += 1
+                if i < al:
+                    pas[i] += 1
+                else:
+                    break
+        for i in range(1, self.max_b + 1):
+            if reach[i] > 0:
+                ratio = pas[i] / reach[i]
+                self.p[i] = ratio if self.w[i] < 1e-6 else (1 - a) * self.p[i] + a * ratio
+                self.w[i] = (1 - a) * self.w[i] + a
+            else:
+                self.w[i] = (1 - a) * self.w[i]
+
+    def prob(self, i: int) -> float | None:
+        return self.p[i] if self.w[i] > 0.05 else None
+
+    def fit_decay(self) -> tuple[float, float]:
+        """Fit observed positional rates to p_i = p0 * r^(i-1)."""
+        xs, ys, ws = [], [], []
+        for i in range(1, self.max_b):
+            p = self.prob(i)
+            if p is not None and p > 1e-3:
+                xs.append(float(i - 1))
+                ys.append(math.log(p))
+                ws.append(self.w[i])
+
+        if not xs:
+            return self.p[0], 0.85
+        if len(xs) == 1:
+            return min(1.0, math.exp(ys[0])), 0.85
+
+        sw = sum(ws)
+        mx = sum(x * w for x, w in zip(xs, ws)) / sw
+        my = sum(y * w for y, w in zip(ys, ws)) / sw
+        var = sum(w * (x - mx) ** 2 for x, w in zip(xs, ws)) / sw
+        cov = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws)) / sw
+        if var < 1e-9:
+            return min(1.0, math.exp(my)), 0.85
+
+        slope = cov / var
+        intercept = my - slope * mx
+        return min(1.0, math.exp(intercept)), min(1.0, math.exp(slope))
+
+    def expected_accept(
+        self,
+        target_b: int,
+        current_b: int,
+        extrapolation_discount: float,
+    ) -> float:
+        """Predict E[commit_len] for *target_b*, including the bonus token."""
+        p0, ratio = self.fit_decay()
+        accept = 1.0
+        cumulative = 1.0
+        for i in range(1, target_b):
+            p = self.prob(i) if i < current_b else None
+            if p is None:
+                p = p0 * (ratio ** (i - 1)) * extrapolation_discount
+            cumulative *= min(1.0, max(0.0, p))
+            accept += cumulative
+        return accept
+
+
+class StepCostModel:
+    """Per-block_size latency EMA + linear extrapolation for unseen sizes.
+
+    Stores latency EMA per block_size (not global regression) because once the
+    controller converges, block_size stops changing and a global least-squares
+    would see zero x-variance and fail to solve for slope b.
+    """
+
+    def __init__(self, ema_alpha: float = 0.1, b_prior: float = 2.14):
+        self.alpha = ema_alpha
+        self.b_prior = b_prior
+        self._t: dict[int, float] = {}
+        self._w: dict[int, float] = {}
+
+    def update(self, block_size: int, step_time_ms: float) -> None:
+        a = self.alpha
+        b = int(block_size)
+        if b not in self._t:
+            self._t[b] = float(step_time_ms)
+            self._w[b] = a
+        else:
+            self._t[b] = (1 - a) * self._t[b] + a * float(step_time_ms)
+            self._w[b] = (1 - a) * self._w[b] + a
+
+    def params(self) -> tuple[float, float]:
+        pts = [
+            (float(b), t, self._w[b])
+            for b, t in self._t.items()
+            if self._w[b] > 1e-3
+        ]
+        if not pts:
+            return 0.0, self.b_prior
+        if len(pts) == 1:
+            x, y, _ = pts[0]
+            return max(0.0, y - self.b_prior * x), self.b_prior
+
+        sw = sum(w for _, _, w in pts)
+        mx = sum(x * w for x, _, w in pts) / sw
+        my = sum(y * w for _, y, w in pts) / sw
+        var = sum(w * (x - mx) ** 2 for x, _, w in pts) / sw
+        cov = sum(w * (x - mx) * (y - my) for x, y, w in pts) / sw
+        b = max(1e-3, cov / var) if var > 1e-9 else self.b_prior
+        return max(0.0, my - b * mx), b
+
+    def predict(self, block_size: int) -> float:
+        b = int(block_size)
+        if b in self._t and self._w[b] > 0.5:
+            return self._t[b]
+        a_, b_ = self.params()
+        return a_ + b_ * block_size
+
+
+class MabAbsSlot:
+    """MAB-ABS decision policy: adaptive block_size via marginal benefit criterion.
+
+    Selects the candidate B minimizing T(B) / E[commit_len(B)].  The initial
+    block size is a hard ceiling; adaptation only moves downward from it.
+    """
+
+    def __init__(self, max_block_size: int, cfg: dict):
+        candidates = sorted(
+            {
+                int(block_size)
+                for block_size in cfg["candidate_block_sizes"]
+                if int(block_size) <= max_block_size
+            }
+        )
+        candidates.append(max_block_size)
+        self.candidates = sorted(set(candidates))
+        self.max_b = max_block_size
+
+        self.warmup_batches = cfg.get("warmup_batches", 10)
+        self.decision_interval = cfg.get("decision_interval", 5)
+        self.hysteresis = cfg.get("hysteresis", 0.02)
+        self.b_cost = cfg.get("b_cost", 2.14)
+        self.extrapolation_discount = cfg.get("extrapolation_discount", 0.9)
+
+        self.current_b = max_block_size
+        self.hist = PositionalAcceptHistogram(max_b=self.max_b)
+        self.cost = StepCostModel(b_prior=self.b_cost)
+        self.batch_count = 0
+        self.decision_count = 0
+
+    def observe(self, commit_lens: list[int], step_time_ms: float) -> None:
+        self.hist.update(commit_lens, self.current_b)
+        self.cost.update(self.current_b, step_time_ms)
+        self.batch_count += 1
+
+    def maybe_decide(self) -> int | None:
+        if self.batch_count <= self.warmup_batches:
+            return None
+        if (self.batch_count - self.warmup_batches) % self.decision_interval != 0:
+            return None
+        self.decision_count += 1
+
+        # Cold-start: cost model needs >= 2 distinct B observations.
+        unseen = [c for c in self.candidates if c not in self.cost._t]
+        if len(self.cost._t) < 2 and unseen:
+            nb = min(unseen, key=lambda c: abs(c - self.current_b))
+            self.current_b = nb
+            return nb
+
+        # Cost-benefit criterion.  Positions below the currently observed B are
+        # exact; positions between current_b and the hard ceiling are decay-fit.
+        evals: dict[int, float] = {}
+        for cand in self.candidates:
+            acc = self.hist.expected_accept(
+                cand,
+                self.current_b,
+                self.extrapolation_discount,
+            )
+            if acc < 1e-6:
+                continue
+            evals[cand] = self.cost.predict(cand) / acc
+        if not evals:
+            return None
+
+        best_b = min(evals, key=evals.get)
+        if best_b == self.current_b:
+            return None
+        cur_tpot = evals.get(self.current_b)
+        if cur_tpot is None:
+            self.current_b = best_b
+            return best_b
+        if evals[best_b] < cur_tpot * (1.0 - self.hysteresis):
+            self.current_b = best_b
+            return best_b
+        return None
+
+
+class AdaptiveDFlashParams:
+    """Routes batch_size to the correct per-BS block_size slot (MAB-ABS)."""
+
+    DEFAULT_CONFIG: dict[str, dict] = {
+        "1": {"candidate_block_sizes": [4, 6, 8]},
+        "8": {"candidate_block_sizes": [3, 4, 5, 6]},
+        "16": {"candidate_block_sizes": [4, 5, 6, 8]},
+        "32": {"candidate_block_sizes": [3, 4, 5]},
+        "64": {"candidate_block_sizes": [4]},
+    }
+
+    def __init__(self, max_block_size: int, cfg_path: str | None = None):
+        if cfg_path is not None:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        else:
+            cfg = self.DEFAULT_CONFIG
+
+        bs_entries: dict[int, dict] = {}
+        for key, entry in cfg.items():
+            if not key.isdigit():
+                continue
+            sizes = entry.get("candidate_block_sizes")
+            if not sizes:
+                continue
+            bs_entries[int(key)] = entry
+
+        if not bs_entries:
+            bs_entries = {1: {"candidate_block_sizes": [4, 6, 8]}}
+
+        self._bs_list: list[int] = sorted(bs_entries)
+        self._slots: dict[int, MabAbsSlot] = {}
+        self._cuda_graph_bs: list[int] | None = None
+        for bs, entry in sorted(bs_entries.items()):
+            self._slots[bs] = MabAbsSlot(
+                max_block_size=max_block_size,
+                cfg={**cfg.get("__defaults__", {}), **entry},
+            )
+
+        first_slot = self._slots[self._bs_list[0]]
+        log_info_on_rank0(
+            logger,
+            f"AdaptiveDFlashParams(MAB-ABS) initialized: "
+            f"block_size={first_slot.current_b}, "
+            f"candidate_block_sizes={first_slot.candidates}",
+        )
+
+    @cached_property
+    def candidate_block_sizes(self) -> list[int]:
+        return sorted({s for p in self._slots.values() for s in p.candidates})
+
+    # --- AdaptiveController compatibility interface ---------------------
+    # AdaptiveController drives the generic spec axis as "steps"; for DFLASH we
+    # reuse that axis to carry block_size (draft_tokens_from_steps = identity,
+    # wired in the controller). The methods below alias the block_size API onto
+    # the step-shaped names the controller expects.
+
+    @property
+    def candidate_steps(self) -> list[int]:
+        """Candidate block_sizes exposed under the controller's step axis."""
+        return self.candidate_block_sizes
+
+    def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
+        self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
+
+    def cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
+        """BS buckets that can reach this block_size at runtime (for capture pruning)."""
+        if self._cuda_graph_bs is None:
+            return None
+        return [
+            v
+            for v in self._cuda_graph_bs
+            if step in self._slots[self._find_closest_bs(v)].candidates
+        ]
+
+    def get_steps_for_batch(self, batch_size: int) -> int:
+        """Alias of get_block_size_for_batch under the controller's step axis."""
+        return self.get_block_size_for_batch(batch_size)
+
+    def get_block_size_for_batch(self, batch_size: int) -> int:
+        return self._route(batch_size).current_b
+
+    def set_block_size_for_batch(
+        self, batch_size: int, block_size: int
+    ) -> None:
+        """Install a decision made by TP rank 0 into this rank's routed slot."""
+        self._route(batch_size).current_b = int(block_size)
+
+    def on_verify_complete(
+        self, accept_lens: list[int], batch_size: int, step_time_ms: float = 0.0
+    ) -> int | None:
+        slot = self._route(batch_size)
+        slot.observe(accept_lens, step_time_ms)
+        return slot.maybe_decide()
+
+    def _route(self, batch_size: int) -> MabAbsSlot:
+        return self._slots[self._find_closest_bs(batch_size)]
 
     def _find_closest_bs(self, target: int) -> int:
         idx = bisect.bisect_right(self._bs_list, target) - 1
