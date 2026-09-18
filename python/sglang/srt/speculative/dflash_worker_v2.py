@@ -398,6 +398,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_probs_buf = None
         self._logged_first_verify = False
         self._full_embed_gpu: Optional[torch.Tensor] = None
+        # (key, length) -> ring of (pinned CPU, device) int32 pairs for async
+        # H2D of the per-batch extend/prefix lens. torch.tensor(list, device=)
+        # goes through a pageable copy that cudaStreamSynchronize's the launch
+        # stream, draining the just-launched forward before the scheduler can
+        # plan the next chunk; a pinned ring keeps the copy stream-ordered.
+        self._h2d_int32_ring: dict = {}
+        # Deferred MAB runtime-state switch. Decisions made on the
+        # result-processing thread must NOT apply_runtime_state() there: the
+        # overlap pipeline has an in-flight batch on the current graphs, and a
+        # swap racing it desynchronizes TP ranks (observed: NCCL broadcast
+        # timeout). The pending value is consumed at forward_batch_generation
+        # entry, where both ranks are collective-lockstepped.
+        self._pending_adaptive_switch: Optional[int] = None
+        # Ceiling for per-B buffer sizing (the MAB never exceeds the initial B).
+        self.max_adaptive_block_size = 1
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(
@@ -483,6 +498,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        # Ceiling for per-B buffer sizing; the MAB never raises the initial B.
+        self.max_adaptive_block_size = int(self.block_size)
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
                 "DFLASH Domino requires speculative_num_draft_tokens > 1, "
@@ -692,6 +709,50 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+        # MAB-ABS: register the current (just-captured) state and build every
+        # lower candidate state. DFLASH drives the controller's step axis as
+        # block_size (draft_tokens_from_steps = identity), so a "step" == a
+        # block_size and each state bundles its own draft+target graphs.
+        if self._mab_enabled and self._mab_controller is not None:
+            from sglang.srt.speculative.adaptive_runtime_state import (
+                AdaptiveController,
+            )
+
+            self._adaptive_controller = AdaptiveController(
+                self,
+                params=self._mab_controller,
+                draft_tokens_from_steps=lambda b: b,
+            )
+            # Register the live state (the graphs init just captured at current B).
+            self._adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=int(self.block_size),
+                    speculative_num_draft_tokens=int(self.block_size),
+                    draft_attn_backend=self.draft_model_runner.attn_backend,
+                    cuda_graph_runner=self.draft_model_runner.decode_cuda_graph_runner,
+                    target_attn_backend=self._target_worker.model_runner.attn_backend,
+                    target_graph_runner=(
+                        self._target_worker.model_runner.decode_cuda_graph_runner
+                    ),
+                    draft_extend_attn_backend=None,
+                    cuda_graph_runner_for_draft_extend=None,
+                    dflash_draft_sampler=self._draft_sampler,
+                    dflash_block_pos_offsets=self._block_pos_offsets,
+                    dflash_draft_block_spec_info=self._draft_block_spec_info,
+                    dflash_fused_kv_helper=self._fused_kv_helper,
+                ),
+                steps=int(self.block_size),
+            )
+            # Build lower candidate states with BS-pruned graph buckets.  The
+            # initial block size is the hard ceiling for every slot.
+            cuda_graph_bs = (
+                None
+                if not capture_decode_cuda_graph
+                else get_exec().graph.cuda_graph_config.decode.bs
+            )
+            self._adaptive_controller.init_states(cuda_graph_bs=cuda_graph_bs)
+        else:
+            self._adaptive_controller = None
 
     def _prewarm_batch_size(self, block_size: int) -> int:
         """Largest batch the non-greedy verify path can see in one step."""
@@ -806,51 +867,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         return result
 
-        # MAB-ABS: register the current (just-captured) state and build every
-        # lower candidate state. DFLASH drives the controller's step axis as
-        # block_size (draft_tokens_from_steps = identity), so a "step" == a
-        # block_size and each state bundles its own draft+target graphs.
-        if self._mab_enabled and self._mab_controller is not None:
-            from sglang.srt.speculative.adaptive_runtime_state import (
-                AdaptiveController,
-            )
-
-            self._adaptive_controller = AdaptiveController(
-                self,
-                params=self._mab_controller,
-                draft_tokens_from_steps=lambda b: b,
-            )
-            # Register the live state (the graphs init just captured at current B).
-            self._adaptive_controller.register(
-                SpecRuntimeState(
-                    speculative_num_steps=int(self.block_size),
-                    speculative_num_draft_tokens=int(self.block_size),
-                    draft_attn_backend=self.draft_model_runner.attn_backend,
-                    cuda_graph_runner=self.draft_model_runner.decode_cuda_graph_runner,
-                    target_attn_backend=self._target_worker.model_runner.attn_backend,
-                    target_graph_runner=(
-                        self._target_worker.model_runner.decode_cuda_graph_runner
-                    ),
-                    draft_extend_attn_backend=None,
-                    cuda_graph_runner_for_draft_extend=None,
-                    dflash_draft_sampler=self._draft_sampler,
-                    dflash_block_pos_offsets=self._block_pos_offsets,
-                    dflash_draft_block_spec_info=self._draft_block_spec_info,
-                    dflash_fused_kv_helper=self._fused_kv_helper,
-                ),
-                steps=int(self.block_size),
-            )
-            # Build lower candidate states with BS-pruned graph buckets.  The
-            # initial block size is the hard ceiling for every slot.
-            cuda_graph_bs = (
-                None
-                if not capture_decode_cuda_graph
-                else get_exec().graph.cuda_graph_config.decode.bs
-            )
-            self._adaptive_controller.init_states(cuda_graph_bs=cuda_graph_bs)
-        else:
-            self._adaptive_controller = None
-
     def on_verify_complete_cpu(
         self,
         num_correct_drafts_per_req: list[int],
@@ -896,7 +912,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._mab_controller.set_block_size_for_batch(
                 batch_size, synced_block_size
             )
-            self._adaptive_controller.activate_step(synced_block_size)
+            self._pending_adaptive_switch = synced_block_size
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         """Activate the per-BS optimal block_size state before each draft round."""
@@ -1117,6 +1133,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.block_size == new_block_size:
             return
 
+        if new_block_size == 0:
+            # Speculation OFF: no runners/helpers to swap -- the plain-decode
+            # branch reads self.block_size == 0 and skips draft+verify. Leave
+            # the draft model's own alignment untouched (it is never invoked
+            # while off; the last live graph state stays intact for re-enable).
+            log_info_on_rank0(
+                logger,
+                f"DFLASH switch adaptive runtime state: block_size "
+                f"{self.block_size} -> 0 (speculation OFF, plain decode)",
+            )
+            self.block_size = 0
+            self.speculative_num_draft_tokens = 0
+            # Drop the target's decode graph runner while off: it still holds
+            # the last verify-width graph, and replaying it on a width-1 plain
+            # decode batch emits block-width logits (sampling shape mismatch).
+            # Re-enable restores the runner from the next state.
+            self._target_worker.model_runner.decode_cuda_graph_runner = None
+            return
+
+        # Re-enabling from OFF: the live runners may have been left from any
+        # prior B; the state swap below restores a consistent set.
         log_info_on_rank0(
             logger,
             f"DFLASH switch adaptive runtime state: block_size "
@@ -1373,7 +1410,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if cap >= int(bs) and buf_block_size == block_size:
             return
 
-        new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
+        # Grow only on demand: doubling on every block-size-triggered realloc
+        # compounds under adaptive switching (cap hit 2**24 -> 4 GiB buffers).
+        new_cap = max(int(bs), cap)
         device = self.device
         self._draft_block_ids_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
@@ -1826,14 +1865,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
         # A fresh dense q would zero the whole vocabulary to carry top_k per row.
+        # Allocate at the max block's gamma once and slice per use: re-allocating
+        # on every block-size change (gamma varies) moves a ~13 GiB tensor per
+        # switch, which under adaptive switching exhausts the graph-pool headroom.
         buffer = self._draft_probs_buf
-        if buffer is None or buffer.shape[0] < bs or buffer.shape[1:] != (gamma, vocab):
+        if (
+            buffer is None
+            or buffer.shape[0] < bs
+            or buffer.shape[1] < gamma
+            or buffer.shape[2] != vocab
+        ):
+            max_gamma = max(gamma, int(self.max_adaptive_block_size) - 1)
             cap = bs if buffer is None else max(bs, buffer.shape[0] * 2)
             buffer = torch.zeros(
-                (cap, gamma, vocab), dtype=torch.float32, device=candidates.device
+                (cap, max_gamma, vocab), dtype=torch.float32, device=candidates.device
             )
             self._draft_probs_buf = buffer
-        draft_probs = buffer[:bs]
+        draft_probs = buffer[:bs, :gamma]
         try:
             draft_probs.scatter_(-1, candidate_ids, q_rows.float())
             accept_len, bonus, _ = accept_sampling(
@@ -2585,6 +2633,35 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=seq_lens)
 
+    def _h2d_int32_async(self, key: str, values: list[int], device) -> torch.Tensor:
+        """Async H2D of a small python int list via a pinned ring.
+
+        The returned device tensor is read by kernels enqueued after this call
+        on the same stream, so stream order is the only correctness contract.
+        The hazard is the pinned side: the host refills it while an older
+        non_blocking copy may still be in flight, hence the 4-slot rotation.
+        """
+        n = len(values)
+        slot = self._h2d_int32_ring.get((key, n))
+        if slot is None:
+            slot = {
+                "next": 0,
+                "pairs": [
+                    (
+                        torch.empty(n, dtype=torch.int32, pin_memory=True),
+                        torch.empty(n, dtype=torch.int32, device=device),
+                    )
+                    for _ in range(4)
+                ],
+            }
+            self._h2d_int32_ring[(key, n)] = slot
+        pinned, dev = slot["pairs"][slot["next"]]
+        slot["next"] = (slot["next"] + 1) % 4
+        for i, v in enumerate(values):
+            pinned[i] = v
+        dev.copy_(pinned, non_blocking=True)
+        return dev
+
     def _make_next_draft_input_decode(
         self,
         *,
@@ -2593,6 +2670,99 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _forward_plain_decode_step(
+        self, batch: ScheduleBatch, draft_input: DFlashDraftInputV2, on_publish=None
+    ) -> GenerationBatchResult:
+        """MAB-ABS off-arm: one plain decode step in place of draft+verify.
+
+        Runs the target as a normal DECODE forward over the committed bonus
+        tokens (the exact tokens verify would have re-checked), samples one
+        token per request, and keeps the DFLASH bookkeeping consistent:
+
+        * the generated token's target hidden state is appended to the draft
+          KV cache (same machinery as the prefill path), so a later
+          0 -> B re-enable drafts over a gapless draft KV;
+        * the returned accept_lens are all 1, feeding the MAB cost model the
+          off-arm's real T(0)/1 objective;
+        * next_draft_input carries the sampled token as the next bonus token,
+          matching the verify path's accept==1 contract.
+        """
+        bs = len(batch.seq_lens)
+        device = self.device
+        bonus = draft_input.bonus_tokens.view(-1).to(torch.int64)
+        prefix_lens = batch.seq_lens.view(-1)
+        req_pool = batch.req_pool_indices.view(-1)
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        # The verify path reserves [prefix, prefix+B) per request in
+        # req_to_token; the plain step consumes only the first slot.
+        out_cache_loc = req_to_token[req_pool.long(), prefix_lens.long()].to(
+            torch.int64
+        )
+        positions = prefix_lens.to(torch.int64)
+        seq_lens = prefix_lens + 1
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            input_ids=bonus,
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            # CPU-known sum (old + bs): avoids a GPU sync for a scalar.
+            seq_lens_sum=batch.seq_lens_sum + bs,
+            positions=positions,
+            sampling_info=batch.sampling_info,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        # The target's decode runner still holds the last verify-width graph
+        # (apply_runtime_state(0) deliberately leaves it for re-enable);
+        # replaying it on this width-1 batch would emit block-width logits.
+        forward_batch.can_run_decode_cuda_graph = False
+        # batch=None keeps OUR ForwardBatch; passing the ScheduleBatch would
+        # make the worker rebuild it via init_new in spec-decode shape. The
+        # capture mode rides on the ForwardBatch itself (set in the ctor).
+        out = self._target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=forward_batch,
+            is_verify=False,
+        )
+        next_token_ids = out.next_token_ids
+
+        hidden = out.logits_output.hidden_states if out.logits_output else None
+        if hidden is not None:
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden,
+                cache_loc=out_cache_loc,
+                positions=positions,
+            )
+
+        new_seq_lens = seq_lens
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+        return GenerationBatchResult(
+            logits_output=out.logits_output,
+            next_token_ids=next_token_ids,
+            accept_lens=torch.ones(bs, dtype=torch.int32, device=device),
+            next_draft_input=self._make_next_draft_input_decode(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=new_seq_lens,
+            ),
+            can_run_cuda_graph=False,
+            # Output row width, not the block size: one committed token per
+            # request, so the spec-v2 unpacking stride is 1 (0 is rejected).
+            speculative_num_draft_tokens=1,
+            new_seq_lens=new_seq_lens,
+        )
+
+    def _apply_pending_adaptive_switch(self) -> None:
+        """Consume a deferred MAB switch at a rank-aligned iteration boundary."""
+        if self._pending_adaptive_switch is None or self._adaptive_controller is None:
+            return
+        b = self._pending_adaptive_switch
+        self._pending_adaptive_switch = None
+        self._adaptive_controller.activate_step(b)
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -2600,6 +2770,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        self._apply_pending_adaptive_switch()
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -2644,9 +2815,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
+            ctx_lens = self._h2d_int32_async("extend_lens", batch.extend_lens, device)
+            draft_seq_lens = self._h2d_int32_async(
+                "prefix_lens", batch.prefix_lens, device
             )
 
             if batch.out_cache_loc is None:
@@ -2750,6 +2921,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if adaptive_step_start_event is not None:
             adaptive_step_start_event.record()
+
+        # --- 0) MAB-ABS "speculation off" arm: plain (non-speculative) decode.
+        if self._mab_enabled and int(self.block_size) == 0:
+            return self._forward_plain_decode_step(batch, draft_input, on_publish)
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model

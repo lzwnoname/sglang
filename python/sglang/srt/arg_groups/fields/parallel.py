@@ -157,6 +157,12 @@ class Parallel(msgspec.Struct):
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
+    prefill_cp_mode: A[str, Arg(no_cli=True)] = "in-seq-split"
+    enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = (
+        False
+    )
+    dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,

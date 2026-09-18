@@ -485,10 +485,70 @@ class StepCostModel:
 
     def predict(self, block_size: int) -> float:
         b = int(block_size)
-        if b in self._t and self._w[b] > 0.5:
+        # 0.4 = one exploration dwell (decision_interval=5 obs at alpha=0.1
+        # gives weight 0.41): a directly measured cost always beats the linear
+        # extrapolation, whose intercept misprices the off-linear B=0 arm.
+        if b in self._t and self._w[b] > 0.4:
             return self._t[b]
         a_, b_ = self.params()
         return a_ + b_ * block_size
+
+
+
+
+class GlobalLinearCostModel:
+    """Shared T(bs, B) = F + c * (bs * B) model, fitted online.
+
+    Replaces per-B cost EMAs in the decision: every observed step contributes a
+    (x = bs*B, y = T) sample regardless of which B it ran at, so the estimate
+    for a candidate never goes stale while another one is active (the frozen-EMA
+    failure mode that kept the controller pinned on a small block after one bad
+    phase). Recency-weighted recursive least squares over a bounded ring.
+    """
+
+    def __init__(self, ring: int = 256, gamma: float = 0.995):
+        self.ring = ring
+        self.gamma = gamma
+        self.xs: list[float] = []
+        self.ys: list[float] = []
+
+    def add(self, x: float, y: float) -> None:
+        self.xs.append(float(x))
+        self.ys.append(float(y))
+        if len(self.xs) > self.ring:
+            self.xs.pop(0)
+            self.ys.pop(0)
+
+    def params(self) -> tuple[float, float]:
+        """Weighted least squares (F, c); falls back to (min-y, 0)."""
+        n = len(self.xs)
+        if n < 4:
+            return (min(self.ys) if self.ys else 0.0, 0.0)
+        sw = sx = sy = sxx = sxy = 0.0
+        for k in range(n):
+            w = self.gamma ** (n - 1 - k)
+            x, y = self.xs[k], self.ys[k]
+            sw += w
+            sx += w * x
+            sy += w * y
+            sxx += w * x * x
+            sxy += w * x * y
+        var = sxx / sw - (sx / sw) ** 2
+        if var < 1e-9:
+            return (sy / sw, 0.0)
+        c = (sxy / sw - (sx / sw) * (sy / sw)) / var
+        return (sy / sw - c * (sx / sw), c)
+
+    def predict(self, x: float) -> float:
+        f, c = self.params()
+        return max(1e-3, f + c * x)
+
+    def last_sample_age(self, x: float) -> int:
+        """Steps since a sample with this x value was added (ring steps max)."""
+        for k in range(len(self.xs) - 1, -1, -1):
+            if abs(self.xs[k] - x) < 0.5:
+                return len(self.xs) - 1 - k
+        return len(self.xs) + 1
 
 
 class MabAbsSlot:
@@ -498,7 +558,7 @@ class MabAbsSlot:
     block size is a hard ceiling; adaptation only moves downward from it.
     """
 
-    def __init__(self, max_block_size: int, cfg: dict):
+    def __init__(self, max_block_size: int, cfg: dict, cost: GlobalLinearCostModel):
         candidates = sorted(
             {
                 int(block_size)
@@ -512,19 +572,45 @@ class MabAbsSlot:
 
         self.warmup_batches = cfg.get("warmup_batches", 10)
         self.decision_interval = cfg.get("decision_interval", 5)
-        self.hysteresis = cfg.get("hysteresis", 0.02)
-        self.b_cost = cfg.get("b_cost", 2.14)
-        self.extrapolation_discount = cfg.get("extrapolation_discount", 0.9)
+        # At bs~1 the predicted T(B) difference between candidates is <2%, so a
+        # thin band flips the argmax on noise alone, graph swaps storm, and the
+        # overlap pipeline hits rank divergence (observed: NCCL broadcast
+        # timeout after 9 switches in one minute). 10% + a post-switch dwell
+        # keeps switches to genuinely structural changes.
+        self.hysteresis = cfg.get("hysteresis", 0.10)
+        self.switch_dwell_decisions = cfg.get("switch_dwell_decisions", 10)
+        # Anti-flap: a switch needs the same argmax preference on N consecutive
+        # decisions. Decode bursts run hundreds of batches per second, so
+        # decision-counted dwell alone can pass in under a second.
+        self.switch_confirm_votes = cfg.get("switch_confirm_votes", 3)
+        self._confirm_candidate: int | None = None
+        self._confirm_votes = 0
+        self._decisions_since_switch = 10_000
+        # Higher than the old 0.9: the periodic explorer refreshes real data for
+        # positions beyond the running block, so extrapolation no longer needs
+        # to double-penalize larger candidates.
+        self.extrapolation_discount = cfg.get("extrapolation_discount", 0.98)
+        # Every N decisions, force one probe of the stalest candidate. This is
+        # the rested-bandit cure for the frozen-cost trap: a candidate measured
+        # once during a bad phase would otherwise never be retried.
+        self.explore_every = cfg.get("explore_every", 20)
 
         self.current_b = max_block_size
         self.hist = PositionalAcceptHistogram(max_b=self.max_b)
-        self.cost = StepCostModel(b_prior=self.b_cost)
+        # Shared across slots: T(bs,B) has one shape regardless of slot.
+        self.cost = cost
+        self._last_bs = 1
         self.batch_count = 0
         self.decision_count = 0
 
-    def observe(self, commit_lens: list[int], step_time_ms: float) -> None:
-        self.hist.update(commit_lens, self.current_b)
-        self.cost.update(self.current_b, step_time_ms)
+    def observe(self, commit_lens: list[int], step_time_ms: float, batch_size: int = 1) -> None:
+        # B=0 is the "speculation off" candidate: every step accepts exactly
+        # the single sampled token, so the positional histogram has nothing to
+        # learn; only the plain-decode cost is tracked (x = 0).
+        if self.current_b != 0:
+            self.hist.update(commit_lens, self.current_b)
+        self.cost.add(self._last_bs * self.current_b, step_time_ms)
+        self._last_bs = max(1, int(batch_size))
         self.batch_count += 1
 
     def maybe_decide(self) -> int | None:
@@ -533,18 +619,33 @@ class MabAbsSlot:
         if (self.batch_count - self.warmup_batches) % self.decision_interval != 0:
             return None
         self.decision_count += 1
+        self._decisions_since_switch += 1
+        if self._decisions_since_switch < self.switch_dwell_decisions:
+            return None
 
-        # Cold-start: cost model needs >= 2 distinct B observations.
-        unseen = [c for c in self.candidates if c not in self.cost._t]
-        if len(self.cost._t) < 2 and unseen:
-            nb = min(unseen, key=lambda c: abs(c - self.current_b))
-            self.current_b = nb
-            return nb
+        # Periodic explorer: probe the stalest other candidate so every arm's
+        # cost and (for larger blocks) accept data stay fresh. Without this a
+        # candidate measured once in a bad phase is never revisited.
+        if self.explore_every and self.decision_count % self.explore_every == 0:
+            others = [c for c in self.candidates if c != self.current_b]
+            if others:
+                nb = max(
+                    others,
+                    key=lambda c: self.cost.last_sample_age(self._last_bs * c),
+                )
+                self.current_b = nb
+                self._decisions_since_switch = 0
+                return nb
 
-        # Cost-benefit criterion.  Positions below the currently observed B are
-        # exact; positions between current_b and the hard ceiling are decay-fit.
+        # Structural cost/benefit: T(bs,B) = F + c*bs*B fitted from ALL recent
+        # steps (never stale), accept from the shared positional histogram.
+        # Bidirectional by construction: whichever B minimizes ms/token wins,
+        # regardless of whether it is larger or smaller than the current one.
         evals: dict[int, float] = {}
         for cand in self.candidates:
+            if cand == 0:
+                evals[0] = self.cost.predict(0)
+                continue
             acc = self.hist.expected_accept(
                 cand,
                 self.current_b,
@@ -552,32 +653,51 @@ class MabAbsSlot:
             )
             if acc < 1e-6:
                 continue
-            evals[cand] = self.cost.predict(cand) / acc
+            evals[cand] = self.cost.predict(self._last_bs * cand) / acc
         if not evals:
             return None
 
         best_b = min(evals, key=evals.get)
         if best_b == self.current_b:
+            self._confirm_candidate = None
+            self._confirm_votes = 0
             return None
         cur_tpot = evals.get(self.current_b)
-        if cur_tpot is None:
-            self.current_b = best_b
-            return best_b
-        if evals[best_b] < cur_tpot * (1.0 - self.hysteresis):
-            self.current_b = best_b
-            return best_b
-        return None
+        warranted = cur_tpot is None or evals[best_b] < cur_tpot * (
+            1.0 - self.hysteresis
+        )
+        if not warranted:
+            self._confirm_candidate = None
+            self._confirm_votes = 0
+            return None
+        # Require the same preference on consecutive decisions before acting.
+        if best_b != self._confirm_candidate:
+            self._confirm_candidate = best_b
+            self._confirm_votes = 1
+            return None
+        self._confirm_votes += 1
+        if self._confirm_votes < self.switch_confirm_votes:
+            return None
+        self.current_b = best_b
+        self._decisions_since_switch = 0
+        self._confirm_candidate = None
+        self._confirm_votes = 0
+        return best_b
 
 
 class AdaptiveDFlashParams:
     """Routes batch_size to the correct per-BS block_size slot (MAB-ABS)."""
 
+    # 0 in a candidate list is the "speculation off" arm: the worker runs a
+    # plain (non-speculative) decode step for that slot. The cost model decides
+    # when it wins -- typically high batch size, where the batched plain step
+    # amortizes weights far better than bs*block-wide verify.
     DEFAULT_CONFIG: dict[str, dict] = {
-        "1": {"candidate_block_sizes": [4, 6, 8]},
-        "8": {"candidate_block_sizes": [3, 4, 5, 6]},
-        "16": {"candidate_block_sizes": [4, 5, 6, 8]},
-        "32": {"candidate_block_sizes": [3, 4, 5]},
-        "64": {"candidate_block_sizes": [4]},
+        "1": {"candidate_block_sizes": [4, 8]},
+        "8": {"candidate_block_sizes": [4, 8]},
+        "16": {"candidate_block_sizes": [4, 8]},
+        "32": {"candidate_block_sizes": [4, 8]},
+        "64": {"candidate_block_sizes": [4, 8]},
     }
 
     def __init__(self, max_block_size: int, cfg_path: str | None = None):
@@ -602,10 +722,14 @@ class AdaptiveDFlashParams:
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, MabAbsSlot] = {}
         self._cuda_graph_bs: list[int] | None = None
+        # One cost model shared by all slots: T(bs,B) = F + c*bs*B has a single
+        # shape, and pooling samples across slots converges far faster.
+        self._shared_cost = GlobalLinearCostModel()
         for bs, entry in sorted(bs_entries.items()):
             self._slots[bs] = MabAbsSlot(
                 max_block_size=max_block_size,
                 cfg={**cfg.get("__defaults__", {}), **entry},
+                cost=self._shared_cost,
             )
 
         first_slot = self._slots[self._bs_list[0]]
@@ -661,7 +785,7 @@ class AdaptiveDFlashParams:
         self, accept_lens: list[int], batch_size: int, step_time_ms: float = 0.0
     ) -> int | None:
         slot = self._route(batch_size)
-        slot.observe(accept_lens, step_time_ms)
+        slot.observe(accept_lens, step_time_ms, batch_size=batch_size)
         return slot.maybe_decide()
 
     def _route(self, batch_size: int) -> MabAbsSlot:

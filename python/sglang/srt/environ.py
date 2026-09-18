@@ -1364,6 +1364,9 @@ class Envs:
     # Mamba state and cache
     # ===================================================================
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
+    # DFlash discriminating experiment: verify only the first K tokens of the
+    # drafted block (draft stays full width). 0 = disabled (verify whole block).
+    SGLANG_DFLASH_VERIFY_TOKENS = EnvInt(0)
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.

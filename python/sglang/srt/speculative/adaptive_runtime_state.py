@@ -140,6 +140,26 @@ class AdaptiveController:
             if steps in self._states:
                 continue
 
+            if steps == 0:
+                # Speculation off: no draft, no verify graph. A bare state
+                # whose speculative_num_draft_tokens == 0 makes the worker take
+                # the plain-decode branch; nothing to capture.
+                self._states[0] = SpecRuntimeState(
+                    speculative_num_steps=0,
+                    speculative_num_draft_tokens=0,
+                    draft_attn_backend=None,
+                    cuda_graph_runner=None,
+                    target_attn_backend=None,
+                    target_graph_runner=None,
+                    draft_extend_attn_backend=None,
+                    cuda_graph_runner_for_draft_extend=None,
+                    dflash_draft_sampler=None,
+                    dflash_block_pos_offsets=None,
+                    dflash_draft_block_spec_info=None,
+                    dflash_fused_kv_helper=None,
+                )
+                continue
+
             pruned_bs = self.params.cuda_graph_bs_for_step(steps)
             state = self.worker.build_adaptive_runtime_state(
                 speculative_num_steps=steps,

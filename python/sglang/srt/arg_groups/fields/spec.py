@@ -223,6 +223,11 @@ class Spec(msgspec.Struct):
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
+    speculative_adaptive_block_size: A[
+        bool,
+        "Enable adaptive block_size for DFLASH speculative decoding (MAB-ABS). "
+        "Block_size adapts per batch based on acceptance rate and cost model.",
+    ] = False
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."
     ] = None

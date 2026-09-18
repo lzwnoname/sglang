@@ -67,6 +67,12 @@ class Schedule(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    prefill_burst_size: A[
+        int,
+        Arg(
+            help="The number of consecutive prefill (chunked-prefill) batches to run before handing the GPU back to decode for --prefill-decode-interval rounds. Together these express an 'x chunked-prefill : y decode' cadence, where x = this flag and y = --prefill-decode-interval. Only meaningful when --prefill-decode-interval > 0. Default 1 reproduces the legacy cadence of one prefill batch followed by y decode rounds.",
+        ),
+    ] = 1
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",

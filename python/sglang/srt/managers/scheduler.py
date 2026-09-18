@@ -1292,6 +1292,13 @@ class Scheduler(
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
+        # "x chunked-prefill : y decode" cadence: x = prefill_burst_size,
+        # y = prefill_decode_interval. Decode only gets the GPU back after x
+        # consecutive prefill batches, so a long prompt makes real progress per
+        # burst instead of being drip-fed one chunk at a time. Default 1
+        # reproduces the legacy cadence (every prefill batch yields y decodes).
+        self.prefill_burst_size = max(1, get_schedule().prefill_burst_size)
+        self._prefill_burst_remaining = self.prefill_burst_size
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1357,7 +1364,13 @@ class Scheduler(
             else batch.forward_mode.is_extend()
         )
         if is_extend:
-            self._prefill_decode_interval_remaining = self.prefill_decode_interval
+            # Count this prefill batch against the current burst. Only once the
+            # burst is exhausted do we force `prefill_decode_interval` decode
+            # rounds. prefill_burst_size == 1 reproduces the legacy behaviour.
+            self._prefill_burst_remaining -= 1
+            if self._prefill_burst_remaining <= 0:
+                self._prefill_burst_remaining = self.prefill_burst_size
+                self._prefill_decode_interval_remaining = self.prefill_decode_interval
 
     def init_metrics_reporter(
         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
