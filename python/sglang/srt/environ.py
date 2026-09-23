@@ -1313,6 +1313,12 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # CSV dump of per-request accept lengths, one row per verify step
+    # (wall_t,rid_idx,verify_ct,bs,accept; accept includes the bonus token).
+    # Benchmark instrumentation for accept-length histograms: the Prometheus
+    # spec_accept_length is a process-lifetime mean and cannot recover the
+    # distribution. Unset in production.
+    SGLANG_SPEC_ACCEPT_TRACE_PATH = EnvStr(None)
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs

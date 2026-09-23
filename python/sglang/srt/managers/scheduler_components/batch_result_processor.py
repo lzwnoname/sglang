@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -90,6 +91,35 @@ def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     if stride is None or stride < 1:
         raise RuntimeError("speculative result is missing a positive output row stride")
     return stride
+
+
+_ACCEPT_TRACE_SINK: list = []
+_ACCEPT_TRACE_RID_IDX: dict = {}
+
+
+def _record_accept_trace(batch: ScheduleBatch, accept_lens: List[int]) -> None:
+    """Append one CSV row per request: wall_t,rid_idx,verify_ct,bs,accept.
+
+    Rows carry the batch's true bs and each request's verify_ct so offline
+    analysis can bucket accept histograms by batch size and track
+    within-request drift. No-op unless SGLANG_SPEC_ACCEPT_TRACE_PATH is set;
+    line-buffered so a killed server keeps the rows collected so far.
+    """
+    if not _ACCEPT_TRACE_SINK:
+        path = envs.SGLANG_SPEC_ACCEPT_TRACE_PATH.get()
+        if not path:
+            return
+        _ACCEPT_TRACE_SINK.append(open(path, "a", buffering=1))
+    f = _ACCEPT_TRACE_SINK[0]
+    t = time.time()
+    bs = len(batch.reqs)
+    rid_idx = _ACCEPT_TRACE_RID_IDX
+    for req, accept in zip(batch.reqs, accept_lens, strict=True):
+        idx = rid_idx.get(req.rid)
+        if idx is None:
+            idx = len(rid_idx)
+            rid_idx[req.rid] = idx
+        f.write(f"{t:.3f},{idx},{req.spec_verify_ct},{bs},{int(accept)}\n")
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -758,6 +788,7 @@ class SchedulerBatchResultProcessor:
             length - num_non_draft for length in accept_lens
         ]
         result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
+        _record_accept_trace(batch, accept_lens)
 
         block_accept_lens = (
             result.block_accept_lens.tolist()

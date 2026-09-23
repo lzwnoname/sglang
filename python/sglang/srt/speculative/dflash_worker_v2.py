@@ -960,6 +960,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.draft_model_runner.decode_cuda_graph_runner,
             list(self.draft_model_runner.capture_tail_hooks),
             self.draft_model_runner.attn_backend,
+            # Per-B wiring rebuilt by build_adaptive_runtime_state. Without
+            # restoring these, the live worker keeps the LAST candidate's
+            # _draft_block_spec_info (num_tokens_per_req=B), and the draft
+            # forward's can_run_graph width check (4 != captured 8) refuses
+            # replay for every step afterwards — the draft falls back to eager
+            # per-layer execution (~17ms vs 1ms, measured). init_states'
+            # closing _activate(initial) does NOT reinstall them: its
+            # apply_runtime_state early-returns because block_size already
+            # equals the initial value once this finally has run.
+            self._block_pos_offsets,
+            self._draft_block_spec_info,
+            self._draft_sampler,
+            self._fused_kv_helper,
+            self._use_fused_kv_materialize,
         )
 
         self.block_size = int(block_size)
@@ -1001,6 +1015,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.draft_model_runner.decode_cuda_graph_runner = backup[5]
             self.draft_model_runner.capture_tail_hooks = backup[6]
             self.draft_model_runner.attn_backend = backup[7]
+            self._block_pos_offsets = backup[8]
+            self._draft_block_spec_info = backup[9]
+            self._draft_sampler = backup[10]
+            self._fused_kv_helper = backup[11]
+            self._use_fused_kv_materialize = backup[12]
             if override_decode_bs:
                 graph_config.decode.bs = backup_decode_bs
 

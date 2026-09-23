@@ -722,13 +722,26 @@ class AdaptiveDFlashParams:
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, MabAbsSlot] = {}
         self._cuda_graph_bs: list[int] | None = None
+        # Activation floor: slots routed below this batch size are locked to the
+        # initial (trained) block — the MAB is inert there. At bs below the
+        # weight-stream floor the step time is flat in B, so switching only
+        # truncates accept (measured: accept 4.0->3.28, TPOT +34%); the gate
+        # makes adaptation a guaranteed no-op until concurrency reaches the
+        # regime where T(B) actually slopes. JSON-configurable per slot or via
+        # __defaults__: {"min_adaptive_bs": 16}.
+        self._min_adaptive_bs = int(
+            cfg.get("__defaults__", {}).get("min_adaptive_bs", 16)
+        )
         # One cost model shared by all slots: T(bs,B) = F + c*bs*B has a single
         # shape, and pooling samples across slots converges far faster.
         self._shared_cost = GlobalLinearCostModel()
         for bs, entry in sorted(bs_entries.items()):
+            slot_cfg = {**cfg.get("__defaults__", {}), **entry}
+            if bs < self._min_adaptive_bs:
+                slot_cfg["candidate_block_sizes"] = [max_block_size]
             self._slots[bs] = MabAbsSlot(
                 max_block_size=max_block_size,
-                cfg={**cfg.get("__defaults__", {}), **entry},
+                cfg=slot_cfg,
                 cost=self._shared_cost,
             )
 
